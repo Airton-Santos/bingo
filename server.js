@@ -3,24 +3,32 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const crypto = require("crypto");
-const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
 
-// Permitir conexões de qualquer origem
 const io = new Server(server, {
   cors: {
-    origin: "*", // Pode restringir depois para seu domínio ex: "https://meubingo.com"
-    methods: ["GET", "POST"]
-  }
+    origin: "*", // para testes. Em produção, restrinja para seu domínio
+    methods: ["GET", "POST"],
+  },
 });
-
-app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-const partidas = {};
+const partidaId = "PARTIDA_UNICA";
+
+const partidas = {
+  [partidaId]: {
+    numeros: [],
+    jogadores: {},
+    vencidos: {
+      quadra: null,
+      quina: null,
+      cartela: null,
+    },
+  },
+};
 
 function gerarCartela() {
   const cartela = [];
@@ -46,6 +54,7 @@ function gerarCartela() {
 }
 
 function sortearNumero(jaSorteados) {
+  if (jaSorteados.length >= 75) return null;
   let n;
   do {
     n = Math.floor(Math.random() * 75) + 1;
@@ -71,54 +80,47 @@ function verificarBingo(cartela, numerosSorteados) {
   return null;
 }
 
-// Gera um ID de partida aleatório tipo 'A1B2C3'
-function gerarIdPartida() {
-  return crypto.randomBytes(3).toString("hex").toUpperCase();
-}
-
 io.on("connection", (socket) => {
-  const partidaId = crypto.randomBytes(3).toString("hex").toUpperCase();
+  console.log("Cliente conectado:", socket.id);
   socket.join(partidaId);
 
-  partidas[partidaId] = {
-    numeros: [],
-    jogadores: {},
-    vencidos: {
-      quadra: null,
-      quina: null,
-      cartela: null,
-    },
-  };
-
   const partida = partidas[partidaId];
+
   const cartela = gerarCartela();
+  partida.jogadores[socket.id] = { cartela, premiacoes: [] };
 
-  partida.jogadores[socket.id] = {
-    cartela,
-    premiacoes: [],
-  };
-
+  // Envia dados iniciais para o cliente
   socket.emit("dadosIniciais", {
     cartela,
-    numerosSorteados: [],
+    numerosSorteados: partida.numeros,
     vencidos: partida.vencidos,
     partidaId,
   });
 
+  // Evento para sortear número
   socket.on("sortearNumero", () => {
     if (
       partida.vencidos.quadra &&
       partida.vencidos.quina &&
       partida.vencidos.cartela
     ) {
-      io.to(partidaId).emit("mensagem", "🎉 O jogo acabou! Todos os bingos foram feitos.");
+      io.to(partidaId).emit(
+        "mensagem",
+        "🎉 O jogo acabou! Todos os bingos foram feitos."
+      );
       return;
     }
 
     const novo = sortearNumero(partida.numeros);
+    if (novo === null) {
+      io.to(partidaId).emit("mensagem", "Todos os números foram sorteados.");
+      return;
+    }
+
     partida.numeros.push(novo);
     io.to(partidaId).emit("novoNumero", novo);
 
+    // Verificar bingo para todos jogadores
     for (const [id, jogador] of Object.entries(partida.jogadores)) {
       const premio = verificarBingo(jogador.cartela, partida.numeros);
 
@@ -136,14 +138,18 @@ io.on("connection", (socket) => {
           partida.vencidos.quina &&
           partida.vencidos.cartela
         ) {
-          io.to(partidaId).emit("mensagem", "🎉 O jogo acabou! Todos os tipos de bingo foram feitos.");
+          io.to(partidaId).emit(
+            "mensagem",
+            "🎉 O jogo acabou! Todos os tipos de bingo foram feitos."
+          );
         }
       }
     }
   });
 
   socket.on("disconnect", () => {
-    delete partidas[partidaId].jogadores[socket.id];
+    console.log("Cliente desconectado:", socket.id);
+    delete partida.jogadores[socket.id];
   });
 });
 
