@@ -26,6 +26,8 @@ const partidas = {
       cartela: null,
     },
     jogoFinalizado: false,
+    sorteioAtivo: false,
+    sorteioInterval: null,
   },
 };
 
@@ -76,7 +78,6 @@ function verificarBingo(cartela, numerosSorteados) {
   return null;
 }
 
-// Função para emitir ganhadores com nomes
 function emitirGanhadores() {
   const partida = partidas[partidaId];
   const ganhadores = {};
@@ -90,26 +91,25 @@ function emitirGanhadores() {
   io.to(partidaId).emit("fimDeJogo", ganhadores);
 }
 
-// Função que verifica se o jogo deve acabar e emite mensagem + ganhadores
 function checarFimDeJogo() {
   const partida = partidas[partidaId];
   const numJogadores = Object.keys(partida.jogadores).length;
 
-  // Se só 1 jogador, fim após primeiro prêmio
   if (numJogadores === 1) {
     const algumPremio = partida.vencidos.quadra || partida.vencidos.quina || partida.vencidos.cartela;
     if (algumPremio) {
       partida.jogoFinalizado = true;
       io.to(partidaId).emit("mensagem", "🎉 Jogo acabou! Um jogador fez um prêmio.");
       emitirGanhadores();
+      pararSorteio();
       return true;
     }
   } else {
-    // Se mais de 1 jogador, fim só quando os 3 prêmios
     if (partida.vencidos.quadra && partida.vencidos.quina && partida.vencidos.cartela) {
       partida.jogoFinalizado = true;
       io.to(partidaId).emit("mensagem", "🎉 O jogo acabou! Todos os prêmios foram conquistados.");
       emitirGanhadores();
+      pararSorteio();
       return true;
     }
   }
@@ -117,42 +117,56 @@ function checarFimDeJogo() {
   return false;
 }
 
-// Sorteio automático a cada 10 segundos
-setInterval(() => {
+// Função para iniciar sorteio automático
+function startSorteio() {
   const partida = partidas[partidaId];
-  if (partida.jogoFinalizado) return;
+  if (partida.sorteioAtivo) return; // já ativo
 
-  // Verifica fim do jogo
-  if (checarFimDeJogo()) return;
-
-  const novo = sortearNumero(partida.numeros);
-  if (novo === null) {
-    partida.jogoFinalizado = true;
-    io.to(partidaId).emit("mensagem", "Todos os números foram sorteados.");
-    emitirGanhadores();
-    return;
-  }
-
-  partida.numeros.push(novo);
-  io.to(partidaId).emit("novoNumero", novo);
-
-  // Verificar bingos para todos jogadores
-  for (const [id, jogador] of Object.entries(partida.jogadores)) {
-    const premio = verificarBingo(jogador.cartela, partida.numeros);
-    if (premio && !jogador.premiacoes.includes(premio)) {
-      jogador.premiacoes.push(premio);
-      partida.vencidos[premio] = id;
-
-      io.to(partidaId).emit(
-        "mensagem",
-        `🎉 Jogador ${jogador.nome} fez ${premio.toUpperCase()}!`
-      );
-
-      // Recheca fim do jogo logo após premiação
-      if (checarFimDeJogo()) return;
+  partida.sorteioAtivo = true;
+  partida.sorteioInterval = setInterval(() => {
+    if (partida.jogoFinalizado) {
+      pararSorteio();
+      return;
     }
+    if (checarFimDeJogo()) return;
+
+    const novo = sortearNumero(partida.numeros);
+    if (novo === null) {
+      partida.jogoFinalizado = true;
+      io.to(partidaId).emit("mensagem", "Todos os números foram sorteados.");
+      emitirGanhadores();
+      pararSorteio();
+      return;
+    }
+
+    partida.numeros.push(novo);
+    io.to(partidaId).emit("novoNumero", novo);
+
+    for (const [id, jogador] of Object.entries(partida.jogadores)) {
+      const premio = verificarBingo(jogador.cartela, partida.numeros);
+      if (premio && !jogador.premiacoes.includes(premio)) {
+        jogador.premiacoes.push(premio);
+        partida.vencidos[premio] = id;
+
+        io.to(partidaId).emit(
+          "mensagem",
+          `🎉 Jogador ${jogador.nome} fez ${premio.toUpperCase()}!`
+        );
+
+        if (checarFimDeJogo()) return;
+      }
+    }
+  }, 10000);
+}
+
+function pararSorteio() {
+  const partida = partidas[partidaId];
+  if (partida.sorteioInterval) {
+    clearInterval(partida.sorteioInterval);
+    partida.sorteioInterval = null;
+    partida.sorteioAtivo = false;
   }
-}, 10000);
+}
 
 io.on("connection", (socket) => {
   console.log("Cliente conectado:", socket.id);
@@ -160,23 +174,34 @@ io.on("connection", (socket) => {
 
   const partida = partidas[partidaId];
 
-  // Recebe nome do jogador e registra com cartela
-  socket.on("registrarJogador", (nome) => {
+  socket.on("participar", (nome) => {
     if (partida.jogoFinalizado) {
       socket.emit("mensagem", "Jogo já finalizado, aguarde próxima partida.");
       return;
     }
-    if (!partida.jogadores[socket.id]) {
-      const cartela = gerarCartela();
-      partida.jogadores[socket.id] = { cartela, nome, premiacoes: [] };
 
-      socket.emit("dadosIniciais", {
-        cartela,
-        numerosSorteados: partida.numeros,
-        vencidos: partida.vencidos,
-        partidaId,
-        nomeJogador: nome,
-      });
+    if (partida.jogadores[socket.id]) {
+      socket.emit("mensagem", "Você já está participando da partida.");
+      return;
+    }
+
+    const cartela = gerarCartela();
+    partida.jogadores[socket.id] = { cartela, nome, premiacoes: [] };
+
+    socket.emit("dadosIniciais", {
+      cartela,
+      numerosSorteados: partida.numeros,
+      vencidos: partida.vencidos,
+      partidaId,
+      nomeJogador: nome,
+    });
+
+    io.to(partidaId).emit("mensagem", `Jogador ${nome} entrou no jogo!`);
+
+    // Se for o primeiro jogador, inicia o sorteio
+    if (Object.keys(partida.jogadores).length === 1) {
+      io.to(partidaId).emit("mensagem", "🎉 Sorteio iniciado!");
+      startSorteio();
     }
   });
 
