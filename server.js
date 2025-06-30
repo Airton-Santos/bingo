@@ -28,6 +28,8 @@ const partidas = {
     jogoFinalizado: false,
     sorteioAtivo: false,
     sorteioInterval: null,
+    cooldownAtivo: false,
+    cooldownTimeout: null,
   },
 };
 
@@ -166,6 +168,24 @@ function pararSorteio() {
     partida.sorteioInterval = null;
     partida.sorteioAtivo = false;
   }
+
+  partida.cooldownAtivo = true;
+
+  io.to(partidaId).emit("mensagem", "⏳ Nova partida em 5 minutos...");
+  io.to(partidaId).emit("cooldownIniciado", 5 * 60); // 5 minutos em segundos
+
+  partida.cooldownTimeout = setTimeout(() => {
+    // Resetar tudo após o cooldown
+    partida.numeros = [];
+    partida.jogadores = {};
+    partida.vencidos = { quadra: null, quina: null, cartela: null };
+    partida.jogoFinalizado = false;
+    partida.cooldownAtivo = false;
+    partida.cooldownTimeout = null;
+
+    io.to(partidaId).emit("mensagem", "✅ Nova partida liberada!");
+    io.to(partidaId).emit("liberarParticipacao");
+  }, 5 * 60 * 1000); // 5 minutos
 }
 
 io.on("connection", (socket) => {
@@ -175,6 +195,11 @@ io.on("connection", (socket) => {
   const partida = partidas[partidaId];
 
   socket.on("participar", (nome) => {
+    if (partida.cooldownAtivo) {
+      socket.emit("mensagem", "Aguarde o início da próxima rodada. Cooldown em andamento.");
+      return;
+    }
+
     if (partida.jogoFinalizado) {
       socket.emit("mensagem", "Jogo já finalizado, aguarde próxima partida.");
       return;
@@ -198,6 +223,9 @@ io.on("connection", (socket) => {
 
     io.to(partidaId).emit("mensagem", `Jogador ${nome} entrou no jogo!`);
 
+    // ADICIONADO: envia o número atualizado de jogadores
+    io.to(partidaId).emit("atualizarNumeroJogadores", Object.keys(partida.jogadores).length);
+
     // Se for o primeiro jogador, inicia o sorteio
     if (Object.keys(partida.jogadores).length === 1) {
       io.to(partidaId).emit("mensagem", "🎉 Sorteio iniciado!");
@@ -208,6 +236,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("Cliente desconectado:", socket.id);
     delete partida.jogadores[socket.id];
+
+    // ADICIONADO: envia o número atualizado de jogadores após desconexão
+    io.to(partidaId).emit("atualizarNumeroJogadores", Object.keys(partida.jogadores).length);
   });
 });
 
