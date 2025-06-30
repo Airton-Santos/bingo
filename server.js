@@ -2,31 +2,30 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "*", // para testes. Em produção, restrinja para seu domínio
+    origin: "*",
     methods: ["GET", "POST"],
   },
 });
 
 const PORT = process.env.PORT || 3000;
-
 const partidaId = "PARTIDA_UNICA";
 
 const partidas = {
   [partidaId]: {
     numeros: [],
-    jogadores: {},
+    jogadores: {}, // socketId: { cartela, nome, premiacoes: [] }
     vencidos: {
       quadra: null,
       quina: null,
       cartela: null,
     },
+    jogoFinalizado: false,
   },
 };
 
@@ -48,7 +47,6 @@ function gerarCartela() {
     }
     cartela.push([...numeros]);
   }
-
   cartela[2][2] = "LIVRE";
   return cartela;
 }
@@ -64,7 +62,6 @@ function sortearNumero(jaSorteados) {
 
 function verificarBingo(cartela, numerosSorteados) {
   let acertos = 0;
-
   for (let col = 0; col < 5; col++) {
     for (let lin = 0; lin < 5; lin++) {
       const val = cartela[col][lin];
@@ -73,12 +70,89 @@ function verificarBingo(cartela, numerosSorteados) {
       }
     }
   }
-
   if (acertos === 25) return "cartela";
   if (acertos >= 15) return "quina";
   if (acertos >= 10) return "quadra";
   return null;
 }
+
+// Função para emitir ganhadores com nomes
+function emitirGanhadores() {
+  const partida = partidas[partidaId];
+  const ganhadores = {};
+  for (const tipo of ["quadra", "quina", "cartela"]) {
+    const socketId = partida.vencidos[tipo];
+    if (socketId) {
+      const jogador = partida.jogadores[socketId];
+      ganhadores[tipo] = jogador ? jogador.nome : "Desconhecido";
+    }
+  }
+  io.to(partidaId).emit("fimDeJogo", ganhadores);
+}
+
+// Função que verifica se o jogo deve acabar e emite mensagem + ganhadores
+function checarFimDeJogo() {
+  const partida = partidas[partidaId];
+  const numJogadores = Object.keys(partida.jogadores).length;
+
+  // Se só 1 jogador, fim após primeiro prêmio
+  if (numJogadores === 1) {
+    const algumPremio = partida.vencidos.quadra || partida.vencidos.quina || partida.vencidos.cartela;
+    if (algumPremio) {
+      partida.jogoFinalizado = true;
+      io.to(partidaId).emit("mensagem", "🎉 Jogo acabou! Um jogador fez um prêmio.");
+      emitirGanhadores();
+      return true;
+    }
+  } else {
+    // Se mais de 1 jogador, fim só quando os 3 prêmios
+    if (partida.vencidos.quadra && partida.vencidos.quina && partida.vencidos.cartela) {
+      partida.jogoFinalizado = true;
+      io.to(partidaId).emit("mensagem", "🎉 O jogo acabou! Todos os prêmios foram conquistados.");
+      emitirGanhadores();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Sorteio automático a cada 10 segundos
+setInterval(() => {
+  const partida = partidas[partidaId];
+  if (partida.jogoFinalizado) return;
+
+  // Verifica fim do jogo
+  if (checarFimDeJogo()) return;
+
+  const novo = sortearNumero(partida.numeros);
+  if (novo === null) {
+    partida.jogoFinalizado = true;
+    io.to(partidaId).emit("mensagem", "Todos os números foram sorteados.");
+    emitirGanhadores();
+    return;
+  }
+
+  partida.numeros.push(novo);
+  io.to(partidaId).emit("novoNumero", novo);
+
+  // Verificar bingos para todos jogadores
+  for (const [id, jogador] of Object.entries(partida.jogadores)) {
+    const premio = verificarBingo(jogador.cartela, partida.numeros);
+    if (premio && !jogador.premiacoes.includes(premio)) {
+      jogador.premiacoes.push(premio);
+      partida.vencidos[premio] = id;
+
+      io.to(partidaId).emit(
+        "mensagem",
+        `🎉 Jogador ${jogador.nome} fez ${premio.toUpperCase()}!`
+      );
+
+      // Recheca fim do jogo logo após premiação
+      if (checarFimDeJogo()) return;
+    }
+  }
+}, 10000);
 
 io.on("connection", (socket) => {
   console.log("Cliente conectado:", socket.id);
@@ -86,64 +160,23 @@ io.on("connection", (socket) => {
 
   const partida = partidas[partidaId];
 
-  const cartela = gerarCartela();
-  partida.jogadores[socket.id] = { cartela, premiacoes: [] };
-
-  // Envia dados iniciais para o cliente
-  socket.emit("dadosIniciais", {
-    cartela,
-    numerosSorteados: partida.numeros,
-    vencidos: partida.vencidos,
-    partidaId,
-  });
-
-  // Evento para sortear número
-  socket.on("sortearNumero", () => {
-    if (
-      partida.vencidos.quadra &&
-      partida.vencidos.quina &&
-      partida.vencidos.cartela
-    ) {
-      io.to(partidaId).emit(
-        "mensagem",
-        "🎉 O jogo acabou! Todos os bingos foram feitos."
-      );
+  // Recebe nome do jogador e registra com cartela
+  socket.on("registrarJogador", (nome) => {
+    if (partida.jogoFinalizado) {
+      socket.emit("mensagem", "Jogo já finalizado, aguarde próxima partida.");
       return;
     }
+    if (!partida.jogadores[socket.id]) {
+      const cartela = gerarCartela();
+      partida.jogadores[socket.id] = { cartela, nome, premiacoes: [] };
 
-    const novo = sortearNumero(partida.numeros);
-    if (novo === null) {
-      io.to(partidaId).emit("mensagem", "Todos os números foram sorteados.");
-      return;
-    }
-
-    partida.numeros.push(novo);
-    io.to(partidaId).emit("novoNumero", novo);
-
-    // Verificar bingo para todos jogadores
-    for (const [id, jogador] of Object.entries(partida.jogadores)) {
-      const premio = verificarBingo(jogador.cartela, partida.numeros);
-
-      if (premio && !jogador.premiacoes.includes(premio)) {
-        jogador.premiacoes.push(premio);
-        partida.vencidos[premio] = id;
-
-        io.to(partidaId).emit(
-          "mensagem",
-          `🎉 Jogador ${id.slice(0, 5)} fez ${premio.toUpperCase()}!`
-        );
-
-        if (
-          partida.vencidos.quadra &&
-          partida.vencidos.quina &&
-          partida.vencidos.cartela
-        ) {
-          io.to(partidaId).emit(
-            "mensagem",
-            "🎉 O jogo acabou! Todos os tipos de bingo foram feitos."
-          );
-        }
-      }
+      socket.emit("dadosIniciais", {
+        cartela,
+        numerosSorteados: partida.numeros,
+        vencidos: partida.vencidos,
+        partidaId,
+        nomeJogador: nome,
+      });
     }
   });
 
